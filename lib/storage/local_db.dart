@@ -23,7 +23,7 @@ class LocalDb {
     final dbPath = p.join(docs.path, 'kc761_mapper.db');
     return openDatabase(
       dbPath,
-      version: 2,
+      version: 3,
       onCreate: (db, version) async {
         await db.execute(
           '''
@@ -45,7 +45,8 @@ class LocalDb {
             longitude REAL NOT NULL,
             cps REAL,
             dose_eq REAL,
-            sensor INTEGER NOT NULL
+            sensor INTEGER NOT NULL,
+            accuracy REAL
           )
           ''',
         );
@@ -53,6 +54,9 @@ class LocalDb {
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
           await db.execute('ALTER TABLE points ADD COLUMN sensor INTEGER');
+        }
+        if (oldVersion < 3) {
+          await db.execute('ALTER TABLE points ADD COLUMN accuracy REAL');
         }
       },
     );
@@ -86,6 +90,7 @@ class LocalDb {
       'cps': measurement.cps,
       'dose_eq': measurement.doseEqRateUvh,
       'sensor': measurement.sensorType.index,
+      'accuracy': measurement.accuracy,
     });
     await db.rawUpdate(
       'UPDATE sessions SET points_count = points_count + 1 WHERE id = ?',
@@ -133,6 +138,7 @@ class LocalDb {
             cps: row['cps'] as double?,
             doseEqRateUvh: row['dose_eq'] as double?,
             sensorType: _sensorFromDb(row['sensor'] as int?),
+            accuracy: row['accuracy'] as double?,
           ),
         )
         .toList();

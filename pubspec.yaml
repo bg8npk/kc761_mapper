@@ -44,6 +44,7 @@ dependencies:
   sqflite: ^2.3.3+1
   flutter_launcher_icons: ^0.14.1
   file_saver: ^0.2.13
+  flutter_map_tile_caching: ^9.0.1
 
 dev_dependencies:
   flutter_test:

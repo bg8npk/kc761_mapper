@@ -6,6 +6,7 @@ class Measurement {
     required this.cps,
     required this.doseEqRateUvh,
     required this.sensorType,
+    required this.accuracy,
   });
 
   final DateTime timestamp;
@@ -14,6 +15,7 @@ class Measurement {
   final double? cps;
   final double? doseEqRateUvh;
   final SensorType sensorType;
+  final double? accuracy;
 }
 
 class TrackSession {

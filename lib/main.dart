@@ -6,6 +6,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' hide Path;
 import 'package:file_saver/file_saver.dart';
@@ -16,8 +17,38 @@ import 'package:permission_handler/permission_handler.dart';
 import 'models/track_models.dart';
 import 'storage/local_db.dart';
 
-void main() {
+const String _osmCacheStore = 'osm_standard_cache';
+const int _osmCacheMaxDbKb = 512000; // 500 MB
+const String _osmStandardUrl =
+    'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+bool _tileCacheReady = false;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await _initTileCache();
   runApp(const Kc761App());
+}
+
+Future<void> _initTileCache() async {
+  try {
+    await FMTCObjectBoxBackend().initialise(maxDatabaseSize: _osmCacheMaxDbKb);
+    const store = FMTCStore(_osmCacheStore);
+    if (!await store.manage.ready) {
+      await store.manage.create();
+    }
+    await store.metadata.set(key: 'sourceURL', value: _osmStandardUrl);
+    await store.metadata.setBulk(
+      kvs: {
+        'validDuration': '0',
+        'maxLength': '0',
+        'behaviour': 'cacheFirst',
+      },
+    );
+    _tileCacheReady = true;
+  } catch (_) {
+    _tileCacheReady = false;
+  }
 }
 
 class Kc761App extends StatelessWidget {
@@ -53,9 +84,11 @@ class _BleMapPageState extends State<BleMapPage> {
   Timer? _recordTimer;
   Timer? _locationFallbackTimer;
   DateTime? _lastPositionAt;
+  double? _lastPositionAccuracy;
   LatLng? _currentLatLng;
   bool _locationReady = false;
   int _tileIndex = 0;
+  bool _autoFollow = true;
 
   BluetoothDevice? _device;
   BluetoothCharacteristic? _rxChar;
@@ -147,9 +180,12 @@ class _BleMapPageState extends State<BleMapPage> {
       }
       setState(() {
         _currentLatLng = next;
+        _lastPositionAccuracy = position.accuracy;
         _locationReady = true;
       });
-      _mapController.move(next, _mapController.camera.zoom);
+      if (_autoFollow) {
+        _mapController.move(next, _mapController.camera.zoom);
+      }
     });
 
     await _fetchSingleFix();
@@ -188,9 +224,12 @@ class _BleMapPageState extends State<BleMapPage> {
     }
     setState(() {
       _currentLatLng = next;
+      _lastPositionAccuracy = position.accuracy;
       _locationReady = true;
     });
-    _mapController.move(next, _mapController.camera.zoom);
+    if (_autoFollow) {
+      _mapController.move(next, _mapController.camera.zoom);
+    }
   }
 
   Future<void> _onConnectPressed() async {
@@ -551,14 +590,15 @@ class _BleMapPageState extends State<BleMapPage> {
       if (!_isRecording || _currentSession == null || _currentLatLng == null) {
         return;
       }
-      final measurement = Measurement(
-        timestamp: DateTime.now(),
-        latitude: _currentLatLng!.latitude,
-        longitude: _currentLatLng!.longitude,
-        cps: _rawCps,
-        doseEqRateUvh: _rawDoseEqRateUvh,
-        sensorType: _sensorType,
-      );
+        final measurement = Measurement(
+          timestamp: DateTime.now(),
+          latitude: _currentLatLng!.latitude,
+          longitude: _currentLatLng!.longitude,
+          cps: _rawCps,
+          doseEqRateUvh: _rawDoseEqRateUvh,
+          sensorType: _sensorType,
+          accuracy: _lastPositionAccuracy,
+        );
       _currentSession!.points.add(measurement);
       final sessionId = _currentSession?.id;
       if (sessionId != null) {
@@ -631,6 +671,25 @@ class _BleMapPageState extends State<BleMapPage> {
                       onTap: () {
                         Navigator.of(context).pop();
                         _showHistory();
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Clear map cache'),
+                      enabled: _tileCacheReady,
+                      onTap: () async {
+                        final confirmed = await _confirmClearCache();
+                        if (!confirmed) {
+                          return;
+                        }
+                        Navigator.of(context).pop();
+                        try {
+                          await const FMTCStore(_osmCacheStore).manage.reset();
+                          _showMessage('Map cache cleared.');
+                        } catch (error) {
+                          _showMessage('Cache clear failed: $error');
+                        }
                       },
                     ),
                   ],
@@ -766,18 +825,19 @@ class _BleMapPageState extends State<BleMapPage> {
       final timestamp = _formatFileTime(session.startedAt);
       final filename = 'kc_mapper_$timestamp.csv';
       final buffer = StringBuffer();
-      buffer.writeln('timestamp,latitude,longitude,sensor,cps,dose_eq_usv_h');
+    buffer.writeln('timestamp,latitude,longitude,sensor,cps,dose_eq_usv_h,accuracy_m');
       for (final point in points) {
-        final sensor = _sensorLabel(point.sensorType);
-        final cps = point.cps?.toStringAsFixed(2) ?? '';
-        final dose = point.doseEqRateUvh?.toStringAsFixed(6) ?? '';
-        buffer.writeln(
-          '${point.timestamp.toIso8601String()},'
-          '${point.latitude.toStringAsFixed(6)},'
-          '${point.longitude.toStringAsFixed(6)},'
-          '$sensor,$cps,$dose',
-        );
-      }
+      final sensor = _sensorLabel(point.sensorType);
+      final cps = point.cps?.toStringAsFixed(2) ?? '';
+      final dose = point.doseEqRateUvh?.toStringAsFixed(6) ?? '';
+      final acc = point.accuracy?.toStringAsFixed(1) ?? '';
+      buffer.writeln(
+        '${point.timestamp.toIso8601String()},'
+        '${point.latitude.toStringAsFixed(6)},'
+        '${point.longitude.toStringAsFixed(6)},'
+        '$sensor,$cps,$dose,$acc',
+      );
+    }
       final csv = buffer.toString();
 
       final savedPath = await _saveWithPicker(filename, csv);
@@ -950,8 +1010,9 @@ class _BleMapPageState extends State<BleMapPage> {
   List<_TileLayerDef> get _tileLayers => const [
         _TileLayerDef(
           name: 'OSM Standard',
-          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          urlTemplate: _osmStandardUrl,
           attribution: '© OpenStreetMap contributors',
+          cacheable: true,
         ),
         _TileLayerDef(
           name: 'OpenTopo',
@@ -972,6 +1033,55 @@ class _BleMapPageState extends State<BleMapPage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
+  }
+
+  Future<bool> _confirmClearCache() async {
+    final cacheSizeText = await _getCacheSizeText();
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Clear map cache?'),
+          content: Text('Cache size: $cacheSizeText\nThis will remove all cached map tiles.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Clear'),
+            ),
+          ],
+        );
+      },
+    );
+    return result ?? false;
+  }
+
+  Future<String> _getCacheSizeText() async {
+    try {
+      final sizeKb = await const FMTCStore(_osmCacheStore).stats.size;
+      return _formatBytes(sizeKb * 1024);
+    } catch (_) {
+      return '--';
+    }
+  }
+
+  String _formatBytes(double bytes) {
+    const kb = 1024.0;
+    const mb = kb * 1024.0;
+    const gb = mb * 1024.0;
+    if (bytes >= gb) {
+      return '${(bytes / gb).toStringAsFixed(2)} GB';
+    }
+    if (bytes >= mb) {
+      return '${(bytes / mb).toStringAsFixed(1)} MB';
+    }
+    if (bytes >= kb) {
+      return '${(bytes / kb).toStringAsFixed(1)} KB';
+    }
+    return '${bytes.toStringAsFixed(0)} B';
   }
 
   SensorType _sensorFromBits(int bits) {
@@ -1063,6 +1173,13 @@ class _BleMapPageState extends State<BleMapPage> {
             options: MapOptions(
               initialCenter: _currentLatLng ?? const LatLng(39.9042, 116.4074),
               initialZoom: 14,
+              onPositionChanged: (position, hasGesture) {
+                if (hasGesture && _autoFollow) {
+                  setState(() {
+                    _autoFollow = false;
+                  });
+                }
+              },
               onTap: (_, __) {
                 setState(() {
                   _selectedPoint = null;
@@ -1073,6 +1190,15 @@ class _BleMapPageState extends State<BleMapPage> {
               TileLayer(
                 urlTemplate: tile.urlTemplate,
                 userAgentPackageName: 'com.example.kc761_mapper',
+                tileProvider: tile.cacheable && _tileCacheReady
+                    ? const FMTCStore(_osmCacheStore).getTileProvider(
+                        settings: FMTCTileProviderSettings(
+                          behavior: CacheBehavior.cacheFirst,
+                          cachedValidDuration: Duration.zero,
+                          maxStoreLength: 0,
+                        ),
+                      )
+                    : null,
               ),
               if (circles.isNotEmpty) CircleLayer(circles: circles),
               if (visiblePoints.isNotEmpty)
@@ -1104,7 +1230,7 @@ class _BleMapPageState extends State<BleMapPage> {
                         height: 120,
                         rotate: false,
                         child: Transform.translate(
-                          offset: const Offset(0, -18),
+                          offset: const Offset(0, -34),
                           child: _PointBubble(
                             measurement: _selectedPoint!,
                           ),
@@ -1182,10 +1308,15 @@ class _BleMapPageState extends State<BleMapPage> {
                   heroTag: 'centerBtn',
                   onPressed: _currentLatLng == null
                       ? null
-                      : () => _mapController.move(
+                      : () {
+                          setState(() {
+                            _autoFollow = true;
+                          });
+                          _mapController.move(
                             _currentLatLng!,
                             _mapController.camera.zoom,
-                          ),
+                          );
+                        },
                   child: const Icon(Icons.my_location),
                 ),
               ],
@@ -1304,11 +1435,13 @@ class _TileLayerDef {
     required this.name,
     required this.urlTemplate,
     required this.attribution,
+    this.cacheable = false,
   });
 
   final String name;
   final String urlTemplate;
   final String attribution;
+  final bool cacheable;
 }
 
 class _OptionRow extends StatelessWidget {
@@ -1392,6 +1525,7 @@ class _PointBubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final cps = measurement.cps?.toStringAsFixed(2) ?? '--';
     final dose = measurement.doseEqRateUvh?.toStringAsFixed(4) ?? '--';
+    final acc = measurement.accuracy?.toStringAsFixed(1) ?? '--';
     final sensor = _sensorLabel(measurement.sensorType);
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1418,6 +1552,11 @@ class _PointBubble extends StatelessWidget {
               const SizedBox(height: 2),
               Text(
                 'Sensor: $sensor',
+                style: const TextStyle(color: Colors.white70, fontSize: 11),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                'Accuracy: ±$acc m',
                 style: const TextStyle(color: Colors.white70, fontSize: 11),
               ),
             ],
