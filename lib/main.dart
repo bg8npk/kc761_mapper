@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui';
 
@@ -7,6 +8,9 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' hide Path;
+import 'package:file_saver/file_saver.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'models/track_models.dart';
@@ -46,6 +50,9 @@ class _BleMapPageState extends State<BleMapPage> {
   final LocalDb _db = LocalDb.instance;
   final MapController _mapController = MapController();
   StreamSubscription<Position>? _posSub;
+  Timer? _recordTimer;
+  Timer? _locationFallbackTimer;
+  DateTime? _lastPositionAt;
   LatLng? _currentLatLng;
   bool _locationReady = false;
   int _tileIndex = 0;
@@ -88,6 +95,8 @@ class _BleMapPageState extends State<BleMapPage> {
     _notifySub?.cancel();
     _connSub?.cancel();
     _posSub?.cancel();
+    _recordTimer?.cancel();
+    _locationFallbackTimer?.cancel();
     _device?.disconnect();
     super.dispose();
   }
@@ -122,12 +131,16 @@ class _BleMapPageState extends State<BleMapPage> {
     }
 
     _posSub?.cancel();
+    final settings = AndroidSettings(
+      accuracy: LocationAccuracy.bestForNavigation,
+      distanceFilter: 0,
+      intervalDuration: Duration(milliseconds: 600),
+      forceLocationManager: true,
+    );
     _posSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.best,
-        distanceFilter: 2,
-      ),
+      locationSettings: settings,
     ).listen((position) {
+      _lastPositionAt = DateTime.now();
       final next = LatLng(position.latitude, position.longitude);
       if (!mounted) {
         return;
@@ -138,6 +151,46 @@ class _BleMapPageState extends State<BleMapPage> {
       });
       _mapController.move(next, _mapController.camera.zoom);
     });
+
+    await _fetchSingleFix();
+    _locationFallbackTimer?.cancel();
+    _locationFallbackTimer =
+        Timer.periodic(const Duration(seconds: 5), (_) async {
+      final last = _lastPositionAt;
+      if (last != null &&
+          DateTime.now().difference(last) < const Duration(seconds: 8)) {
+        return;
+      }
+      await _fetchSingleFix();
+    });
+  }
+
+  Future<void> _fetchSingleFix() async {
+    try {
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.bestForNavigation,
+        timeLimit: const Duration(seconds: 5),
+      );
+      _applyPosition(position);
+    } catch (_) {
+      final last = await Geolocator.getLastKnownPosition();
+      if (last != null) {
+        _applyPosition(last);
+      }
+    }
+  }
+
+  void _applyPosition(Position position) {
+    _lastPositionAt = DateTime.now();
+    final next = LatLng(position.latitude, position.longitude);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _currentLatLng = next;
+      _locationReady = true;
+    });
+    _mapController.move(next, _mapController.camera.zoom);
   }
 
   Future<void> _onConnectPressed() async {
@@ -424,21 +477,6 @@ class _BleMapPageState extends State<BleMapPage> {
       _deviceTempC = tempC;
       _sensorType = _sensorFromBits(sensorBits);
 
-      if (_isRecording && _currentLatLng != null) {
-        final measurement = Measurement(
-          timestamp: DateTime.now(),
-          latitude: _currentLatLng!.latitude,
-          longitude: _currentLatLng!.longitude,
-          cps: _rawCps,
-          doseEqRateUvh: _rawDoseEqRateUvh,
-          sensorType: _sensorType,
-        );
-        _currentSession?.points.add(measurement);
-        final sessionId = _currentSession?.id;
-        if (sessionId != null) {
-          _db.insertPoint(sessionId, measurement);
-        }
-      }
     });
   }
 
@@ -480,6 +518,7 @@ class _BleMapPageState extends State<BleMapPage> {
         }
         _currentSession = null;
       });
+      _stopRecordTimer();
       _loadSessions();
       return;
     }
@@ -503,6 +542,35 @@ class _BleMapPageState extends State<BleMapPage> {
       );
       _selectedSession = null;
     });
+    _startRecordTimer();
+  }
+
+  void _startRecordTimer() {
+    _recordTimer?.cancel();
+    _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!_isRecording || _currentSession == null || _currentLatLng == null) {
+        return;
+      }
+      final measurement = Measurement(
+        timestamp: DateTime.now(),
+        latitude: _currentLatLng!.latitude,
+        longitude: _currentLatLng!.longitude,
+        cps: _rawCps,
+        doseEqRateUvh: _rawDoseEqRateUvh,
+        sensorType: _sensorType,
+      );
+      _currentSession!.points.add(measurement);
+      final sessionId = _currentSession?.id;
+      if (sessionId != null) {
+        _db.insertPoint(sessionId, measurement);
+      }
+      setState(() {});
+    });
+  }
+
+  void _stopRecordTimer() {
+    _recordTimer?.cancel();
+    _recordTimer = null;
   }
 
   void _showOptions() {
@@ -628,6 +696,7 @@ class _BleMapPageState extends State<BleMapPage> {
                           title: Text(_formatTime(session.startedAt)),
                           subtitle: Text('${session.pointsCount} points'),
                           trailing: isSelected ? const Icon(Icons.check) : null,
+                          onLongPress: () => _showSessionActions(session),
                           onTap: () async {
                             if (isSelected) {
                               setState(() {
@@ -660,6 +729,130 @@ class _BleMapPageState extends State<BleMapPage> {
                 ),
             ],
           ),
+        );
+      },
+    );
+  }
+
+  void _showSessionActions(TrackSession session) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                title: const Text('Export CSV'),
+                onTap: () async {
+                  Navigator.of(context).pop();
+                  await _exportSessionCsv(session);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _exportSessionCsv(TrackSession session) async {
+    try {
+      final points = await _db.fetchPoints(session.id);
+      if (points.isEmpty) {
+        _showExportDialog('No points to export.', null);
+        return;
+      }
+      final timestamp = _formatFileTime(session.startedAt);
+      final filename = 'kc_mapper_$timestamp.csv';
+      final buffer = StringBuffer();
+      buffer.writeln('timestamp,latitude,longitude,sensor,cps,dose_eq_usv_h');
+      for (final point in points) {
+        final sensor = _sensorLabel(point.sensorType);
+        final cps = point.cps?.toStringAsFixed(2) ?? '';
+        final dose = point.doseEqRateUvh?.toStringAsFixed(6) ?? '';
+        buffer.writeln(
+          '${point.timestamp.toIso8601String()},'
+          '${point.latitude.toStringAsFixed(6)},'
+          '${point.longitude.toStringAsFixed(6)},'
+          '$sensor,$cps,$dose',
+        );
+      }
+      final csv = buffer.toString();
+
+      final savedPath = await _saveWithPicker(filename, csv);
+      if (savedPath != null) {
+        _showExportDialog('Exported CSV', savedPath);
+        return;
+      }
+
+      final downloadDir = await _getDownloadDirectory();
+      if (downloadDir != null) {
+        final path = p.join(downloadDir.path, filename);
+        try {
+          await File(path).writeAsString(csv);
+          _showExportDialog('Exported CSV', path);
+          return;
+        } catch (_) {
+          // Fall back to app documents directory.
+        }
+      }
+      final docs = await getApplicationDocumentsDirectory();
+      final fallbackPath = p.join(docs.path, filename);
+      await File(fallbackPath).writeAsString(csv);
+      _showExportDialog('Exported CSV (app storage)', fallbackPath);
+    } catch (error) {
+      _showExportDialog('Export failed', error.toString());
+    }
+  }
+
+  Future<String?> _saveWithPicker(String filename, String content) async {
+    try {
+      final bytes = Uint8List.fromList(content.codeUnits);
+      final result = await FileSaver.instance.saveAs(
+        name: filename,
+        bytes: bytes,
+        ext: 'csv',
+        mimeType: MimeType.csv,
+      );
+      return result;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Directory?> _getDownloadDirectory() async {
+    if (!Platform.isAndroid) {
+      return null;
+    }
+    try {
+      final dir = await getDownloadsDirectory();
+      if (dir == null) {
+        return null;
+      }
+      await dir.create(recursive: true);
+      return dir;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _showExportDialog(String title, String? detail) {
+    if (!mounted) {
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(title),
+          content: detail == null ? null : Text(detail),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
         );
       },
     );
@@ -802,6 +995,28 @@ class _BleMapPageState extends State<BleMapPage> {
     return '$y-$m-$d $h:$min:$s';
   }
 
+  String _formatFileTime(DateTime time) {
+    final t = time.toLocal();
+    final y = t.year.toString().padLeft(4, '0');
+    final m = t.month.toString().padLeft(2, '0');
+    final d = t.day.toString().padLeft(2, '0');
+    final h = t.hour.toString().padLeft(2, '0');
+    final min = t.minute.toString().padLeft(2, '0');
+    final s = t.second.toString().padLeft(2, '0');
+    return '${y}${m}${d}_${h}${min}${s}';
+  }
+
+  String _sensorLabel(SensorType type) {
+    switch (type) {
+      case SensorType.gamma:
+        return 'γ';
+      case SensorType.neutron:
+        return 'n';
+      case SensorType.pin:
+        return 'PIN';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final deviceName = _device?.platformName.isNotEmpty == true
@@ -889,7 +1104,7 @@ class _BleMapPageState extends State<BleMapPage> {
                         height: 120,
                         rotate: false,
                         child: Transform.translate(
-                          offset: const Offset(0, -15),
+                          offset: const Offset(0, -18),
                           child: _PointBubble(
                             measurement: _selectedPoint!,
                           ),
