@@ -4,8 +4,10 @@ import 'dart:math' show Point;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
@@ -15,6 +17,8 @@ import 'package:file_saver/file_saver.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:camera/camera.dart';
+import 'package:image/image.dart' as img;
 
 import 'models/track_models.dart';
 import 'storage/local_db.dart';
@@ -134,6 +138,11 @@ class _BleMapPageState extends State<BleMapPage> {
   bool _spectrumLogY = false;
   bool _spectrumDirty = false;
   McCalibration? _calibration;
+  bool _cameraMode = false;
+  bool _cameraInitializing = false;
+  bool _cameraBusy = false;
+  bool _includeGpsStamp = false;
+  CameraController? _cameraController;
 
   @override
   void initState() {
@@ -155,6 +164,8 @@ class _BleMapPageState extends State<BleMapPage> {
     _spectrumPollTimer?.cancel();
     _spectrumRedrawDebounce?.cancel();
     _locationFallbackTimer?.cancel();
+    _cameraController?.dispose();
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     _device?.disconnect();
     super.dispose();
   }
@@ -255,6 +266,393 @@ class _BleMapPageState extends State<BleMapPage> {
     if (_autoFollow) {
       _mapController.move(next, _mapController.camera.zoom);
     }
+  }
+
+  Future<void> _enterCameraMode() async {
+    if (_cameraMode || _cameraInitializing) {
+      return;
+    }
+    final permission = await Permission.camera.request();
+    if (!permission.isGranted) {
+      _showMessage('Camera permission is required.');
+      return;
+    }
+    await SystemChrome.setPreferredOrientations(
+      [DeviceOrientation.portraitUp],
+    );
+    setState(() {
+      _cameraMode = true;
+      _cameraInitializing = true;
+    });
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        throw Exception('No camera available.');
+      }
+      final preferred = cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      final controller = CameraController(
+        preferred,
+        ResolutionPreset.veryHigh,
+        enableAudio: false,
+      );
+      await controller.initialize();
+      await controller.setFlashMode(FlashMode.off);
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      setState(() {
+        _cameraController = controller;
+        _cameraInitializing = false;
+      });
+    } catch (_) {
+      await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _cameraMode = false;
+        _cameraInitializing = false;
+        _cameraController = null;
+      });
+      _showMessage('Failed to start camera.');
+    }
+  }
+
+  Future<void> _exitCameraMode() async {
+    if (!_cameraMode) {
+      return;
+    }
+    await _cameraController?.dispose();
+    _cameraController = null;
+    await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _cameraMode = false;
+      _cameraInitializing = false;
+    });
+  }
+
+  Future<ui.Image> _decodeImage(Uint8List bytes) {
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromList(bytes, completer.complete);
+    return completer.future;
+  }
+
+  Future<Uint8List> _encodePhotoJpeg(ui.Image image) async {
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (data == null) {
+      throw Exception('Failed to read image data.');
+    }
+    final bytes = data.buffer.asUint8List();
+    final decoded = img.Image.fromBytes(
+      width: image.width,
+      height: image.height,
+      bytes: bytes.buffer,
+      bytesOffset: bytes.offsetInBytes,
+      numChannels: 4,
+    );
+    final jpg = img.encodeJpg(decoded, quality: 90);
+    return Uint8List.fromList(jpg);
+  }
+
+  Future<void> _capturePhoto() async {
+    final controller = _cameraController;
+    if (controller == null || _cameraBusy || !controller.value.isInitialized) {
+      return;
+    }
+    if (controller.value.isTakingPicture) {
+      return;
+    }
+    setState(() {
+      _cameraBusy = true;
+    });
+    try {
+      final file = await controller.takePicture();
+      final bytes = await file.readAsBytes();
+      final baseImage = await _decodeImage(bytes);
+      final normalized = await _normalizePhoto(baseImage);
+      final composed = await _composePhoto(normalized);
+      final jpg = await _encodePhotoJpeg(composed);
+      final filename = 'kc_mapper_${_formatFileTime(DateTime.now())}';
+      final path = await FileSaver.instance.saveAs(
+        name: filename,
+        bytes: jpg,
+        ext: 'jpg',
+        mimeType: MimeType.jpeg,
+      );
+      if (!mounted) {
+        return;
+      }
+      _showMessage(
+        path == null
+            ? 'Photo saved.'
+            : 'Photo saved (Pictures): $path',
+      );
+    } catch (error) {
+      if (mounted) {
+        _showMessage('Failed to capture photo: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _cameraBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<ui.Image> _normalizePhoto(ui.Image base) async {
+    if (base.width <= base.height) {
+      return base;
+    }
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final size = Size(base.height.toDouble(), base.width.toDouble());
+    canvas.translate(size.width, 0);
+    canvas.rotate(math.pi / 2);
+    canvas.drawImage(base, Offset.zero, Paint());
+    final picture = recorder.endRecording();
+    return picture.toImage(size.width.round(), size.height.round());
+  }
+
+  Future<ui.Image> _composePhoto(ui.Image base) async {
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final size = Size(base.width.toDouble(), base.height.toDouble());
+    canvas.drawImage(base, Offset.zero, Paint());
+
+    final pad = math.max(16.0, size.width * 0.04);
+    final barHeight = math.max(56.0, size.height * 0.08);
+    final panelWidth = size.width - pad * 2;
+    final statusRect =
+        RRect.fromRectAndRadius(Rect.fromLTWH(pad, pad, panelWidth, barHeight),
+            const Radius.circular(12));
+    final panelPaint = Paint()..color = const Color(0xB0000000);
+    canvas.drawRRect(statusRect, panelPaint);
+
+    final cpsValue = _rawCps?.toStringAsFixed(2) ?? '--';
+    final doseValue = _rawDoseEqRateUvh?.toStringAsFixed(4) ?? '--';
+    final line1 = 'CPS $cpsValue    Dose Eq $doseValue μSv/h';
+    final infoParts = <String>[];
+    final deviceName = _device?.platformName.isNotEmpty == true
+        ? _device!.platformName
+        : (_device?.remoteId.str ?? '');
+    if (deviceName.isNotEmpty) {
+      infoParts.add(deviceName);
+    }
+    if (_batteryPercent != null) {
+      infoParts.add('${_batteryPercent}%');
+    }
+    if (_airPressureHpa != null) {
+      infoParts.add('${_airPressureHpa!.toStringAsFixed(0)} hPa');
+    }
+    if (_deviceTempC != null) {
+      infoParts.add('${_deviceTempC!.toStringAsFixed(1)} C');
+    }
+    final line2 = infoParts.join('    ');
+    final line3 = _includeGpsStamp && _currentLatLng != null
+        ? 'GPS ${_currentLatLng!.latitude.toStringAsFixed(5)}, '
+            '${_currentLatLng!.longitude.toStringAsFixed(5)}'
+            '${_lastPositionAccuracy == null ? '' : ' (±${_lastPositionAccuracy!.toStringAsFixed(0)}m)'}'
+        : '';
+
+    _drawText(
+      canvas,
+      line1,
+      Offset(pad + 12, pad + 8),
+      fontSize: math.max(14, barHeight * 0.32),
+      color: Colors.white,
+      maxWidth: panelWidth - 24,
+    );
+    if (line2.isNotEmpty) {
+      _drawText(
+        canvas,
+        line2,
+        Offset(pad + 12, pad + barHeight * 0.52),
+        fontSize: math.max(12, barHeight * 0.24),
+        color: Colors.white70,
+        maxWidth: panelWidth - 24,
+      );
+    }
+    if (line3.isNotEmpty) {
+      _drawText(
+        canvas,
+        line3,
+        Offset(pad + 12, pad + barHeight * 0.78),
+        fontSize: math.max(11, barHeight * 0.2),
+        color: Colors.white70,
+        maxWidth: panelWidth - 24,
+      );
+    }
+
+    final spectrumTop = pad + barHeight + pad * 0.6;
+    final spectrumHeight = math.min(
+      math.max(90.0, size.height * 0.18),
+      size.height - spectrumTop - pad,
+    );
+    if (spectrumHeight > 60) {
+      final spectrumRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(pad, spectrumTop, panelWidth, spectrumHeight),
+        const Radius.circular(12),
+      );
+      canvas.drawRRect(spectrumRect, panelPaint);
+
+      final panelPadding = 10.0;
+      final axisHeight = 22.0;
+      final plotSize = Size(
+        panelWidth - panelPadding * 2,
+        spectrumHeight - panelPadding * 2 - axisHeight,
+      );
+      final plotOffset =
+          Offset(pad + panelPadding, spectrumTop + panelPadding);
+      canvas.save();
+      canvas.translate(plotOffset.dx, plotOffset.dy);
+      _SpectrumPainter(
+        data: _spectrumData[_spectrumSourceForSensor(_sensorType)] ?? const [],
+        logY: _spectrumLogY,
+      ).paint(canvas, plotSize);
+      canvas.restore();
+
+      _drawText(
+        canvas,
+        _spectrumLogY ? 'Y: log' : 'Y: linear',
+        Offset(pad + panelPadding, spectrumTop + panelPadding - 2),
+        fontSize: math.max(10, size.width * 0.018),
+        color: Colors.white70,
+      );
+
+      final ticks = _buildSpectrumTicksForPhoto(
+        _spectrumData[_spectrumSourceForSensor(_sensorType)] ?? const [],
+        _spectrumSourceForSensor(_sensorType),
+      );
+      final axisTop = plotOffset.dy + plotSize.height;
+      final labelStyle = TextStyle(
+        color: Colors.white70,
+        fontSize: math.max(10, size.width * 0.018),
+      );
+      for (final tick in ticks) {
+        final x = plotOffset.dx + (tick.alignX + 1) * 0.5 * plotSize.width;
+        canvas.drawRect(
+          Rect.fromLTWH(x, axisTop, 1, 6),
+          Paint()..color = Colors.white54,
+        );
+        final label = _formatEnergyLabel(tick.energy);
+        final painter = TextPainter(
+          text: TextSpan(text: label, style: labelStyle),
+          textAlign: TextAlign.center,
+          textDirection: TextDirection.ltr,
+        );
+        painter.layout();
+        final left = (x - painter.width / 2)
+            .clamp(plotOffset.dx, plotOffset.dx + plotSize.width - painter.width);
+        painter.paint(canvas, Offset(left, axisTop + 8));
+      }
+      final unitPainter = TextPainter(
+        text: TextSpan(text: 'keV', style: labelStyle),
+        textDirection: TextDirection.ltr,
+      );
+      unitPainter.layout();
+      unitPainter.paint(
+        canvas,
+        Offset(
+          pad + panelWidth - unitPainter.width,
+          spectrumTop + spectrumHeight - unitPainter.height,
+        ),
+      );
+    }
+
+    final picture = recorder.endRecording();
+    return picture.toImage(size.width.round(), size.height.round());
+  }
+
+  List<_SpectrumTick> _buildSpectrumTicksForPhoto(
+    List<double> data,
+    McSource source,
+  ) {
+    if (data.length <= 1) {
+      return const [];
+    }
+    final targets = [100.0, 662.0, 1460.0, 2614.0];
+    final last = data.length - 1;
+    final ticks = <_SpectrumTick>[];
+    int? lastIndex;
+
+    for (final target in targets) {
+      int? bestIndex;
+      double? bestEnergy;
+      var bestDiff = double.infinity;
+      for (var i = 0; i < data.length; i++) {
+        final energy = _energyForChannel(i, source);
+        if (energy == null || energy <= 0) {
+          continue;
+        }
+        final diff = (energy - target).abs();
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIndex = i;
+          bestEnergy = energy;
+        }
+      }
+      if (bestIndex == null || bestEnergy == null) {
+        continue;
+      }
+      if (lastIndex != null && bestIndex == lastIndex) {
+        continue;
+      }
+      lastIndex = bestIndex;
+      final align = (bestIndex / last) * 2 - 1;
+      ticks.add(_SpectrumTick(align, bestEnergy));
+    }
+
+    return ticks;
+  }
+
+  String _formatEnergyLabel(double? value) {
+    if (value == null) {
+      return '--';
+    }
+    if (value < 0) {
+      value = 0;
+    }
+    if (value >= 1000) {
+      return value.toStringAsFixed(0);
+    }
+    if (value >= 100) {
+      return value.toStringAsFixed(1);
+    }
+    return value.toStringAsFixed(2);
+  }
+
+  void _drawText(
+    Canvas canvas,
+    String text,
+    Offset offset, {
+    double fontSize = 12,
+    Color color = Colors.white,
+    double? maxWidth,
+    TextAlign align = TextAlign.left,
+  }) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: color,
+          fontSize: fontSize,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      textAlign: align,
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    );
+    painter.layout(maxWidth: maxWidth ?? double.infinity);
+    painter.paint(canvas, offset);
   }
 
   Future<void> _onConnectPressed() async {
@@ -713,6 +1111,9 @@ class _BleMapPageState extends State<BleMapPage> {
       rad0Node1: rad0Node1,
       rad0Node2: rad0Node2,
     );
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   List<double> _readCalPoly(ByteData view, int offset) {
@@ -1632,12 +2033,43 @@ class _BleMapPageState extends State<BleMapPage> {
     }
   }
 
+  Widget _buildCameraPreview(BuildContext context) {
+    final controller = _cameraController!;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final previewSize = controller.value.previewSize;
+        if (previewSize == null) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final previewWidth = previewSize.height;
+        final previewHeight = previewSize.width;
+        return ClipRect(
+          child: SizedBox.expand(
+            child: FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: previewWidth,
+                height: previewHeight,
+                child: CameraPreview(controller),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final deviceName = _device?.platformName.isNotEmpty == true
         ? _device!.platformName
         : (_device?.remoteId.str ?? '-');
     final deviceInfo = _statusText == 'Connected' ? deviceName : '';
+    final gpsText = _includeGpsStamp && _currentLatLng != null
+        ? '${_currentLatLng!.latitude.toStringAsFixed(5)}, '
+            '${_currentLatLng!.longitude.toStringAsFixed(5)}'
+            '${_lastPositionAccuracy == null ? '' : ' (±${_lastPositionAccuracy!.toStringAsFixed(0)}m)'}'
+        : '';
     final tile = _tileLayers[_tileIndex];
     final visiblePoints = _displayPoints;
     final range = _rangeForMetric(visiblePoints);
@@ -1658,115 +2090,138 @@ class _BleMapPageState extends State<BleMapPage> {
     final rightPad = media.padding.right;
     final isLandscape = media.orientation == Orientation.landscape;
     final overlayBottom = bottomPad + (isLandscape ? 96 : 200);
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('KC761 Mapper'),
         actions: [
           TextButton(
             onPressed: _isConnecting ? null : _onConnectPressed,
-            child: Text(
-              _statusText == 'Connected' ? 'Disconnect' : 'Connect',
-              style: TextStyle(
-                color: _statusText == 'Connected'
-                    ? Theme.of(context).colorScheme.error
-                    : Theme.of(context).colorScheme.primary,
-              ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_isConnecting)
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                if (_isConnecting) const SizedBox(width: 6),
+                Text(
+                  _statusText == 'Connected' ? 'Disconnect' : 'Connect',
+                  style: TextStyle(
+                    color: _statusText == 'Connected'
+                        ? Theme.of(context).colorScheme.error
+                        : Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+              ],
             ),
           ),
         ],
       ),
       body: Stack(
         children: [
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter: _currentLatLng ?? const LatLng(39.9042, 116.4074),
-              initialZoom: 14,
-              onPositionChanged: (position, hasGesture) {
-                if (hasGesture && _autoFollow) {
+          if (_cameraMode)
+            Container(
+              color: Colors.black,
+              child: _cameraController != null &&
+                      _cameraController!.value.isInitialized
+                  ? _buildCameraPreview(context)
+                  : const Center(
+                      child: CircularProgressIndicator(),
+                    ),
+            )
+          else
+            FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: _currentLatLng ?? const LatLng(39.9042, 116.4074),
+                initialZoom: 14,
+                onPositionChanged: (position, hasGesture) {
+                  if (hasGesture && _autoFollow) {
+                    setState(() {
+                      _autoFollow = false;
+                    });
+                  }
+                  _scheduleAggregateRebuild();
+                },
+                onTap: (_, __) {
                   setState(() {
-                    _autoFollow = false;
+                    _selectedPoint = null;
                   });
-                }
-                _scheduleAggregateRebuild();
-              },
-              onTap: (_, __) {
-                setState(() {
-                  _selectedPoint = null;
-                });
-              },
-            ),
-            children: [
-              TileLayer(
-                urlTemplate: tile.urlTemplate,
-                userAgentPackageName: 'com.example.kc761_mapper',
-                tileProvider: tile.cacheable && _tileCacheReady
-                    ? const FMTCStore(_osmCacheStore).getTileProvider(
-                        settings: FMTCTileProviderSettings(
-                          behavior: CacheBehavior.cacheFirst,
-                          cachedValidDuration: Duration.zero,
-                          maxStoreLength: 0,
-                        ),
-                      )
-                    : null,
+                },
               ),
-              if (circles.isNotEmpty) CircleLayer(circles: circles),
-              if (visiblePoints.isNotEmpty)
-                MarkerLayer(
-                  markers: [
-                    for (final point in visiblePoints)
-                      Marker(
-                        point: LatLng(point.latitude, point.longitude),
-                        width: 36,
-                        height: 36,
-                        alignment: Alignment.center,
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: () {
-                            setState(() {
-                              _selectedPoint = point;
-                            });
-                          },
-                          child: const SizedBox.expand(),
-                        ),
-                      ),
-                    if (_selectedPoint != null)
-                      Marker(
-                        point: LatLng(
-                          _selectedPoint!.latitude,
-                          _selectedPoint!.longitude,
-                        ),
-                        width: 220,
-                        height: 120,
-                        rotate: false,
-                        child: Transform.translate(
-                          offset: const Offset(0, -34),
-                          child: _PointBubble(
-                            measurement: _selectedPoint!,
+              children: [
+                TileLayer(
+                  urlTemplate: tile.urlTemplate,
+                  userAgentPackageName: 'com.example.kc761_mapper',
+                  tileProvider: tile.cacheable && _tileCacheReady
+                      ? const FMTCStore(_osmCacheStore).getTileProvider(
+                          settings: FMTCTileProviderSettings(
+                            behavior: CacheBehavior.cacheFirst,
+                            cachedValidDuration: Duration.zero,
+                            maxStoreLength: 0,
+                          ),
+                        )
+                      : null,
+                ),
+                if (circles.isNotEmpty) CircleLayer(circles: circles),
+                if (visiblePoints.isNotEmpty)
+                  MarkerLayer(
+                    markers: [
+                      for (final point in visiblePoints)
+                        Marker(
+                          point: LatLng(point.latitude, point.longitude),
+                          width: 36,
+                          height: 36,
+                          alignment: Alignment.center,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () {
+                              setState(() {
+                                _selectedPoint = point;
+                              });
+                            },
+                            child: const SizedBox.expand(),
                           ),
                         ),
+                      if (_selectedPoint != null)
+                        Marker(
+                          point: LatLng(
+                            _selectedPoint!.latitude,
+                            _selectedPoint!.longitude,
+                          ),
+                          width: 220,
+                          height: 120,
+                          rotate: false,
+                          child: Transform.translate(
+                            offset: const Offset(0, -34),
+                            child: _PointBubble(
+                              measurement: _selectedPoint!,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                if (_currentLatLng != null)
+                  MarkerLayer(
+                    markers: [
+                      Marker(
+                        point: _currentLatLng!,
+                        width: 28,
+                        height: 28,
+                        child:
+                            const Icon(Icons.my_location, color: Colors.blueAccent),
                       ),
+                    ],
+                  ),
+                RichAttributionWidget(
+                  attributions: [
+                    TextSourceAttribution(tile.attribution),
                   ],
                 ),
-              if (_currentLatLng != null)
-                MarkerLayer(
-                  markers: [
-                    Marker(
-                      point: _currentLatLng!,
-                      width: 28,
-                      height: 28,
-                      child: const Icon(Icons.my_location, color: Colors.blueAccent),
-                    ),
-                  ],
-                ),
-              RichAttributionWidget(
-                attributions: [
-                  TextSourceAttribution(tile.attribution),
-                ],
-              ),
-            ],
-          ),
+              ],
+            ),
           Positioned(
             left: 16 + leftPad,
             right: 16 + rightPad,
@@ -1779,6 +2234,7 @@ class _BleMapPageState extends State<BleMapPage> {
                     cps: _rawCps,
                     doseEqRateUvh: _rawDoseEqRateUvh,
                     deviceName: deviceInfo,
+                    gpsText: gpsText,
                     batteryPercent: _batteryPercent,
                     airPressureHpa: _airPressureHpa,
                     deviceTempC: _deviceTempC,
@@ -1806,35 +2262,52 @@ class _BleMapPageState extends State<BleMapPage> {
               ),
             ),
           ),
-          Positioned(
-            right: 16 + rightPad,
-            bottom: overlayBottom,
-            child: Column(
-              children: [
-                FloatingActionButton.small(
-                  heroTag: 'layerBtn',
-                  onPressed: _cycleTileLayer,
-                  child: const Icon(Icons.layers_outlined),
-                ),
-                const SizedBox(height: 8),
-                FloatingActionButton.small(
-                  heroTag: 'centerBtn',
-                  onPressed: _currentLatLng == null
-                      ? null
-                      : () {
-                          setState(() {
-                            _autoFollow = true;
-                          });
-                          _mapController.move(
-                            _currentLatLng!,
-                            _mapController.camera.zoom,
-                          );
-                        },
-                  child: const Icon(Icons.my_location),
-                ),
-              ],
+          if (!_cameraMode)
+            Positioned(
+              right: 16 + rightPad,
+              bottom: overlayBottom,
+              child: Column(
+                children: [
+                  FloatingActionButton.small(
+                    heroTag: 'layerBtn',
+                    onPressed: _cycleTileLayer,
+                    child: const Icon(Icons.layers_outlined),
+                  ),
+                  const SizedBox(height: 8),
+                  FloatingActionButton.small(
+                    heroTag: 'centerBtn',
+                    onPressed: _currentLatLng == null
+                        ? null
+                        : () {
+                            setState(() {
+                              _autoFollow = true;
+                            });
+                            _mapController.move(
+                              _currentLatLng!,
+                              _mapController.camera.zoom,
+                            );
+                          },
+                    child: const Icon(Icons.my_location),
+                  ),
+                ],
+              ),
             ),
-          ),
+          if (_cameraMode)
+            Positioned(
+              right: 16 + rightPad,
+              bottom: 16 + bottomPad + 64,
+              child: FloatingActionButton.small(
+                heroTag: 'gpsStampBtn',
+                onPressed: () {
+                  setState(() {
+                    _includeGpsStamp = !_includeGpsStamp;
+                  });
+                },
+                child: Icon(
+                  _includeGpsStamp ? Icons.location_on : Icons.location_off,
+                ),
+              ),
+            ),
           Positioned(
             left: 16,
             right: 16,
@@ -1844,13 +2317,17 @@ class _BleMapPageState extends State<BleMapPage> {
                 SizedBox(
                   width: 140,
                   child: ElevatedButton(
-                    onPressed: _toggleRecording,
+                    onPressed: _cameraMode ? _exitCameraMode : _toggleRecording,
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _isRecording ? Colors.redAccent : null,
-                      foregroundColor: _isRecording ? Colors.white : null,
+                      backgroundColor:
+                          _cameraMode ? null : (_isRecording ? Colors.redAccent : null),
+                      foregroundColor:
+                          _cameraMode ? null : (_isRecording ? Colors.white : null),
                       padding: const EdgeInsets.symmetric(vertical: 10),
                     ),
-                    child: Text(_isRecording ? 'Stop' : 'Start'),
+                    child: Text(
+                      _cameraMode ? 'Map' : (_isRecording ? 'Stop' : 'Start'),
+                    ),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -1860,6 +2337,28 @@ class _BleMapPageState extends State<BleMapPage> {
                     padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
                   ),
                   child: const Icon(Icons.more_horiz),
+                ),
+                const Spacer(),
+                ElevatedButton(
+                  onPressed: _cameraMode
+                      ? (_cameraBusy ? null : _capturePhoto)
+                      : (_cameraInitializing ? null : _enterCameraMode),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+                  ),
+                  child: _cameraMode && _cameraBusy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          _cameraMode
+                              ? Icons.camera_alt
+                              : (_cameraInitializing
+                                  ? Icons.hourglass_empty
+                                  : Icons.photo_camera_outlined),
+                        ),
                 ),
               ],
             ),
@@ -1875,6 +2374,7 @@ class _TopStatusBar extends StatelessWidget {
     required this.cps,
     required this.doseEqRateUvh,
     required this.deviceName,
+    required this.gpsText,
     required this.batteryPercent,
     required this.airPressureHpa,
     required this.deviceTempC,
@@ -1884,6 +2384,7 @@ class _TopStatusBar extends StatelessWidget {
   final double? cps;
   final double? doseEqRateUvh;
   final String deviceName;
+  final String gpsText;
   final int? batteryPercent;
   final double? airPressureHpa;
   final double? deviceTempC;
@@ -1905,6 +2406,9 @@ class _TopStatusBar extends StatelessWidget {
     final infoWidgets = <Widget>[];
     if (deviceName.isNotEmpty) {
       infoWidgets.add(Text(deviceName, style: labelStyle));
+    }
+    if (gpsText.isNotEmpty) {
+      infoWidgets.add(Text('GPS $gpsText', style: labelStyle));
     }
     if (batteryPercent != null) {
       infoWidgets.add(
@@ -2284,51 +2788,8 @@ class _SpectrumAxisLabels extends StatelessWidget {
     }
     return SizedBox(
       height: 22,
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              for (final tick in ticks)
-                Positioned(
-                  top: 0,
-                  left: (tick.alignX + 1) * 0.5 * constraints.maxWidth,
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      Container(
-                        width: 1,
-                        height: 6,
-                        color: Colors.white54,
-                      ),
-                      Positioned(
-                        top: 8,
-                        left: -24,
-                        width: 48,
-                        child: Text(
-                          _formatNumber(tick.energy),
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 10,
-                          ),
-                          textAlign: TextAlign.center,
-                          overflow: TextOverflow.visible,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              Positioned(
-                right: 0,
-                bottom: 0,
-                child: Text(
-                  'keV',
-                  style: const TextStyle(color: Colors.white70, fontSize: 10),
-                ),
-              ),
-            ],
-          );
-        },
+      child: CustomPaint(
+        painter: _SpectrumAxisPainter(ticks: ticks),
       ),
     );
   }
@@ -2372,7 +2833,7 @@ class _SpectrumAxisLabels extends StatelessWidget {
     return ticks;
   }
 
-  String _formatNumber(double? value) {
+  static String _formatNumber(double? value) {
     if (value == null) {
       return '--';
     }
@@ -2394,6 +2855,48 @@ class _SpectrumTick {
 
   final double alignX;
   final double? energy;
+}
+
+class _SpectrumAxisPainter extends CustomPainter {
+  const _SpectrumAxisPainter({required this.ticks});
+
+  final List<_SpectrumTick> ticks;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (ticks.isEmpty) {
+      return;
+    }
+    const labelStyle = TextStyle(color: Colors.white70, fontSize: 10);
+    final linePaint = Paint()..color = Colors.white54;
+    for (final tick in ticks) {
+      final x = (tick.alignX + 1) * 0.5 * size.width;
+      canvas.drawRect(Rect.fromLTWH(x, 0, 1, 6), linePaint);
+      final text = _SpectrumAxisLabels._formatNumber(tick.energy);
+      final painter = TextPainter(
+        text: const TextSpan(style: labelStyle),
+        textAlign: TextAlign.center,
+        textDirection: TextDirection.ltr,
+      );
+      painter.text = TextSpan(text: text, style: labelStyle);
+      painter.layout();
+      final left = (x - painter.width / 2)
+          .clamp(0.0, size.width - painter.width)
+          .toDouble();
+      painter.paint(canvas, Offset(left, 8));
+    }
+    final unit = TextPainter(
+      text: const TextSpan(text: 'keV', style: labelStyle),
+      textDirection: TextDirection.ltr,
+    );
+    unit.layout();
+    unit.paint(canvas, Offset(size.width - unit.width, size.height - unit.height));
+  }
+
+  @override
+  bool shouldRepaint(covariant _SpectrumAxisPainter oldDelegate) {
+    return oldDelegate.ticks != ticks;
+  }
 }
 
 class _SpectrumPainter extends CustomPainter {
