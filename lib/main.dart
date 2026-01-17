@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' show Point;
 import 'dart:typed_data';
 import 'dart:ui';
 
@@ -77,11 +78,13 @@ class BleMapPage extends StatefulWidget {
 class _BleMapPageState extends State<BleMapPage> {
   static final Guid _rxUuid = Guid('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
   static final Guid _txUuid = Guid('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+  static const double _clusterCellPx = 32.0;
 
   final LocalDb _db = LocalDb.instance;
   final MapController _mapController = MapController();
   StreamSubscription<Position>? _posSub;
   Timer? _recordTimer;
+  Timer? _aggregateDebounce;
   Timer? _locationFallbackTimer;
   DateTime? _lastPositionAt;
   double? _lastPositionAccuracy;
@@ -115,12 +118,17 @@ class _BleMapPageState extends State<BleMapPage> {
   TrackSession? _currentSession;
   TrackSession? _selectedSession;
   Measurement? _selectedPoint;
+  List<Measurement> _aggregatedPoints = [];
+  bool _aggregationReady = false;
 
   @override
   void initState() {
     super.initState();
     _startLocationUpdates();
     _loadSessions();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scheduleAggregateRebuild();
+    });
   }
 
   @override
@@ -129,6 +137,7 @@ class _BleMapPageState extends State<BleMapPage> {
     _connSub?.cancel();
     _posSub?.cancel();
     _recordTimer?.cancel();
+    _aggregateDebounce?.cancel();
     _locationFallbackTimer?.cancel();
     _device?.disconnect();
     super.dispose();
@@ -559,6 +568,7 @@ class _BleMapPageState extends State<BleMapPage> {
       });
       _stopRecordTimer();
       _loadSessions();
+      _scheduleAggregateRebuild();
       return;
     }
 
@@ -580,8 +590,12 @@ class _BleMapPageState extends State<BleMapPage> {
         points: [],
       );
       _selectedSession = null;
+      _aggregatedPoints = [];
+      _aggregationReady = false;
+      _selectedPoint = null;
     });
     _startRecordTimer();
+    _scheduleAggregateRebuild();
   }
 
   void _startRecordTimer() {
@@ -590,21 +604,22 @@ class _BleMapPageState extends State<BleMapPage> {
       if (!_isRecording || _currentSession == null || _currentLatLng == null) {
         return;
       }
-        final measurement = Measurement(
-          timestamp: DateTime.now(),
-          latitude: _currentLatLng!.latitude,
-          longitude: _currentLatLng!.longitude,
-          cps: _rawCps,
-          doseEqRateUvh: _rawDoseEqRateUvh,
-          sensorType: _sensorType,
-          accuracy: _lastPositionAccuracy,
-        );
+      final measurement = Measurement(
+        timestamp: DateTime.now(),
+        latitude: _currentLatLng!.latitude,
+        longitude: _currentLatLng!.longitude,
+        cps: _rawCps,
+        doseEqRateUvh: _rawDoseEqRateUvh,
+        sensorType: _sensorType,
+        accuracy: _lastPositionAccuracy,
+      );
       _currentSession!.points.add(measurement);
       final sessionId = _currentSession?.id;
       if (sessionId != null) {
         _db.insertPoint(sessionId, measurement);
       }
       setState(() {});
+      _scheduleAggregateRebuild();
     });
   }
 
@@ -616,14 +631,16 @@ class _BleMapPageState extends State<BleMapPage> {
   void _showOptions() {
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setModalState) {
             final neutronEnabled = _hasNeutron != false;
             final pinEnabled = _hasPin != false;
+            final bottomPad = MediaQuery.of(context).padding.bottom;
             return SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
+              child: SingleChildScrollView(
+                padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + bottomPad),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -750,6 +767,7 @@ class _BleMapPageState extends State<BleMapPage> {
                               _selectedSession = null;
                             }
                           });
+                          _scheduleAggregateRebuild();
                         },
                         child: ListTile(
                           title: Text(_formatTime(session.startedAt)),
@@ -761,6 +779,7 @@ class _BleMapPageState extends State<BleMapPage> {
                               setState(() {
                                 _selectedSession = null;
                               });
+                              _scheduleAggregateRebuild();
                               Navigator.of(context).pop();
                               return;
                             }
@@ -779,6 +798,7 @@ class _BleMapPageState extends State<BleMapPage> {
                               _isRecording = false;
                               _currentSession = null;
                             });
+                            _scheduleAggregateRebuild();
                             Navigator.of(context).pop();
                           },
                         ),
@@ -918,6 +938,166 @@ class _BleMapPageState extends State<BleMapPage> {
     );
   }
 
+  void _scheduleAggregateRebuild() {
+    _aggregateDebounce?.cancel();
+    _aggregateDebounce = Timer(
+      const Duration(milliseconds: 200),
+      _rebuildAggregates,
+    );
+  }
+
+  void _rebuildAggregates() {
+    if (!mounted) {
+      return;
+    }
+    final points = _visiblePoints;
+    final camera = _mapController.camera;
+    final size = camera.nonRotatedSize;
+    if (size.x <= 0 || size.y <= 0) {
+      return;
+    }
+    if (points.isEmpty) {
+      if (_aggregatedPoints.isNotEmpty) {
+        setState(() {
+          _aggregatedPoints = [];
+          _selectedPoint = null;
+          _aggregationReady = true;
+        });
+      } else if (!_aggregationReady) {
+        setState(() {
+          _aggregationReady = true;
+        });
+      }
+      return;
+    }
+
+    final buckets = <String, List<Measurement>>{};
+    for (final point in points) {
+      final screen =
+          camera.latLngToScreenPoint(LatLng(point.latitude, point.longitude));
+      if (screen.x < -_clusterCellPx ||
+          screen.y < -_clusterCellPx ||
+          screen.x > size.x + _clusterCellPx ||
+          screen.y > size.y + _clusterCellPx) {
+        continue;
+      }
+      final cellX = (screen.x / _clusterCellPx).floor();
+      final cellY = (screen.y / _clusterCellPx).floor();
+      final key = '$cellX:$cellY';
+      buckets.putIfAbsent(key, () => []).add(point);
+    }
+
+    final aggregated = <Measurement>[];
+    for (final bucket in buckets.values) {
+      aggregated.add(_aggregateBucket(bucket));
+    }
+
+    final nextSelected = _selectedPoint == null
+        ? null
+        : _matchSelectedPoint(_selectedPoint!, aggregated, camera);
+
+    setState(() {
+      _aggregatedPoints = aggregated;
+      _selectedPoint = nextSelected;
+      _aggregationReady = true;
+    });
+  }
+
+  Measurement _aggregateBucket(List<Measurement> points) {
+    if (points.length == 1) {
+      return points.first;
+    }
+    final lat = _median(points.map((p) => p.latitude).toList()) ??
+        points.first.latitude;
+    final lng = _median(points.map((p) => p.longitude).toList()) ??
+        points.first.longitude;
+    final cps = _medianNullable(points.map((p) => p.cps));
+    final dose = _medianNullable(points.map((p) => p.doseEqRateUvh));
+    final acc = _medianNullable(points.map((p) => p.accuracy));
+    final timestampMs =
+        _medianInt(points.map((p) => p.timestamp.millisecondsSinceEpoch).toList());
+    final timestamp = timestampMs == null
+        ? points.first.timestamp
+        : DateTime.fromMillisecondsSinceEpoch(timestampMs);
+    final sensor = _modeSensor(points);
+
+    return Measurement(
+      timestamp: timestamp,
+      latitude: lat,
+      longitude: lng,
+      cps: cps,
+      doseEqRateUvh: dose,
+      sensorType: sensor,
+      accuracy: acc,
+    );
+  }
+
+  double? _medianNullable(Iterable<double?> values) {
+    return _median(values.whereType<double>().toList());
+  }
+
+  double? _median(List<double> values) {
+    if (values.isEmpty) {
+      return null;
+    }
+    values.sort();
+    final mid = values.length ~/ 2;
+    if (values.length.isOdd) {
+      return values[mid];
+    }
+    return (values[mid - 1] + values[mid]) / 2.0;
+  }
+
+  int? _medianInt(List<int> values) {
+    if (values.isEmpty) {
+      return null;
+    }
+    values.sort();
+    final mid = values.length ~/ 2;
+    if (values.length.isOdd) {
+      return values[mid];
+    }
+    return ((values[mid - 1] + values[mid]) / 2).round();
+  }
+
+  SensorType _modeSensor(List<Measurement> points) {
+    final counts = <SensorType, int>{};
+    for (final point in points) {
+      counts[point.sensorType] = (counts[point.sensorType] ?? 0) + 1;
+    }
+    return counts.entries
+        .reduce((a, b) => a.value >= b.value ? a : b)
+        .key;
+  }
+
+  Measurement? _matchSelectedPoint(
+    Measurement selected,
+    List<Measurement> aggregated,
+    MapCamera camera,
+  ) {
+    if (aggregated.isEmpty) {
+      return null;
+    }
+    final target = camera
+        .latLngToScreenPoint(LatLng(selected.latitude, selected.longitude));
+    final maxDist = _clusterCellPx;
+    final maxDistSq = maxDist * maxDist;
+    Measurement? best;
+    double bestSq = double.infinity;
+    for (final point in aggregated) {
+      final screen =
+          camera.latLngToScreenPoint(LatLng(point.latitude, point.longitude));
+      final dx = screen.x - target.x;
+      final dy = screen.y - target.y;
+      final distSq = dx * dx + dy * dy;
+      if (distSq <= maxDistSq && distSq < bestSq) {
+        bestSq = distSq;
+        best = point;
+      }
+    }
+    return best;
+  }
+
   List<Measurement> get _visiblePoints {
     if (_isRecording && _currentSession != null) {
       return _currentSession!.points;
@@ -926,6 +1106,13 @@ class _BleMapPageState extends State<BleMapPage> {
       return _selectedSession!.points;
     }
     return const [];
+  }
+
+  List<Measurement> get _displayPoints {
+    if (_aggregationReady) {
+      return _aggregatedPoints;
+    }
+    return _visiblePoints;
   }
 
   _Range? _rangeForMetric(List<Measurement> points) {
@@ -1143,8 +1330,9 @@ class _BleMapPageState extends State<BleMapPage> {
     final deviceName = _device?.platformName.isNotEmpty == true
         ? _device!.platformName
         : (_device?.remoteId.str ?? '-');
+    final deviceInfo = _statusText == 'Connected' ? deviceName : '';
     final tile = _tileLayers[_tileIndex];
-    final visiblePoints = _visiblePoints;
+    final visiblePoints = _displayPoints;
     final range = _rangeForMetric(visiblePoints);
     final circles = visiblePoints
         .map(
@@ -1157,8 +1345,12 @@ class _BleMapPageState extends State<BleMapPage> {
           ),
         )
         .toList();
-    final bottomPad = MediaQuery.of(context).padding.bottom;
-    final overlayBottom = bottomPad + 200;
+    final media = MediaQuery.of(context);
+    final bottomPad = media.padding.bottom;
+    final leftPad = media.padding.left;
+    final rightPad = media.padding.right;
+    final isLandscape = media.orientation == Orientation.landscape;
+    final overlayBottom = bottomPad + (isLandscape ? 96 : 200);
 
     return Scaffold(
       appBar: AppBar(
@@ -1190,6 +1382,7 @@ class _BleMapPageState extends State<BleMapPage> {
                     _autoFollow = false;
                   });
                 }
+                _scheduleAggregateRebuild();
               },
               onTap: (_, __) {
                 setState(() {
@@ -1268,44 +1461,23 @@ class _BleMapPageState extends State<BleMapPage> {
             ],
           ),
           Positioned(
-            left: 16,
-            right: 16,
+            left: 16 + leftPad,
+            right: 16 + rightPad,
             top: 8,
             child: SafeArea(
               child: _TopStatusBar(
                 cps: _rawCps,
                 doseEqRateUvh: _rawDoseEqRateUvh,
+                deviceName: deviceInfo,
+                batteryPercent: _batteryPercent,
+                airPressureHpa: _airPressureHpa,
+                deviceTempC: _deviceTempC,
+                compact: isLandscape,
               ),
             ),
           ),
           Positioned(
-            left: 16,
-            bottom: overlayBottom,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _StatusBadge(text: 'BLE: $_statusText'),
-                const SizedBox(height: 6),
-                _StatusBadge(text: 'Device: $deviceName'),
-                const SizedBox(height: 6),
-                _StatusBadge(text: _locationReady ? 'GPS: ready' : 'GPS: waiting'),
-                if (_batteryPercent != null) ...[
-                  const SizedBox(height: 6),
-                  _StatusBadge(text: 'Battery: $_batteryPercent%'),
-                ],
-                if (_airPressureHpa != null) ...[
-                  const SizedBox(height: 6),
-                  _StatusBadge(text: 'Pressure: ${_airPressureHpa!.toStringAsFixed(0)} hPa'),
-                ],
-                if (_deviceTempC != null) ...[
-                  const SizedBox(height: 6),
-                  _StatusBadge(text: 'Temp: ${_deviceTempC!.toStringAsFixed(1)} C'),
-                ],
-              ],
-            ),
-          ),
-          Positioned(
-            right: 16,
+            right: 16 + rightPad,
             bottom: overlayBottom,
             child: Column(
               children: [
@@ -1372,69 +1544,113 @@ class _TopStatusBar extends StatelessWidget {
   const _TopStatusBar({
     required this.cps,
     required this.doseEqRateUvh,
+    required this.deviceName,
+    required this.batteryPercent,
+    required this.airPressureHpa,
+    required this.deviceTempC,
+    this.compact = false,
   });
 
   final double? cps;
   final double? doseEqRateUvh;
+  final String deviceName;
+  final int? batteryPercent;
+  final double? airPressureHpa;
+  final double? deviceTempC;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     final cpsValue = cps?.toStringAsFixed(2) ?? '--';
     final doseValue = doseEqRateUvh?.toStringAsFixed(4) ?? '--';
+    final valueStyle = TextStyle(
+      color: Colors.white,
+      fontWeight: FontWeight.w600,
+      fontSize: compact ? 12 : 14,
+    );
+    final labelStyle = TextStyle(
+      color: Colors.white70,
+      fontSize: compact ? 11 : 12,
+    );
+    final infoWidgets = <Widget>[];
+    if (deviceName.isNotEmpty) {
+      infoWidgets.add(Text(deviceName, style: labelStyle));
+    }
+    if (batteryPercent != null) {
+      infoWidgets.add(
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.battery_full,
+              size: compact ? 12 : 14,
+              color: Colors.white70,
+            ),
+            const SizedBox(width: 4),
+            Text('${batteryPercent!}%', style: labelStyle),
+          ],
+        ),
+      );
+    }
+    if (airPressureHpa != null) {
+      infoWidgets.add(
+        Text(
+          '${airPressureHpa!.toStringAsFixed(0)} hPa',
+          style: labelStyle,
+        ),
+      );
+    }
+    if (deviceTempC != null) {
+      infoWidgets.add(
+        Text(
+          '${deviceTempC!.toStringAsFixed(1)} C',
+          style: labelStyle,
+        ),
+      );
+    }
+
     return DecoratedBox(
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.5),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        child: Row(
-          children: [
-            const Text('CPS', style: TextStyle(color: Colors.white70)),
-            const SizedBox(width: 8),
-            Text(
-              cpsValue,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(width: 16),
-            const Text('Dose Eq', style: TextStyle(color: Colors.white70)),
-            const SizedBox(width: 8),
-            Text(
-              doseValue,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(width: 6),
-            const Text('μSv/h', style: TextStyle(color: Colors.white70)),
-          ],
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 10 : 14,
+          vertical: compact ? 6 : 10,
         ),
-      ),
-    );
-  }
-}
-
-class _StatusBadge extends StatelessWidget {
-  const _StatusBadge({required this.text});
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.5),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        child: Text(
-          text,
-          style: const TextStyle(color: Colors.white, fontSize: 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Text('CPS', style: labelStyle),
+                const SizedBox(width: 8),
+                Text(
+                  cpsValue,
+                  style: valueStyle,
+                ),
+                const SizedBox(width: 16),
+                Text('Dose Eq', style: labelStyle),
+                const SizedBox(width: 8),
+                Text(
+                  doseValue,
+                  style: valueStyle,
+                ),
+                const SizedBox(width: 6),
+                Text('μSv/h', style: labelStyle),
+              ],
+            ),
+            if (infoWidgets.isNotEmpty) ...[
+              SizedBox(height: compact ? 4 : 6),
+              Wrap(
+                spacing: compact ? 8 : 12,
+                runSpacing: compact ? 2 : 4,
+                children: infoWidgets,
+              ),
+            ],
+          ],
         ),
       ),
     );
