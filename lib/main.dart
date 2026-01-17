@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' show Point;
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui';
 
@@ -79,12 +80,16 @@ class _BleMapPageState extends State<BleMapPage> {
   static final Guid _rxUuid = Guid('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
   static final Guid _txUuid = Guid('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
   static const double _clusterCellPx = 32.0;
+  static const int _spectrumPollMs = 1000;
+  static const int _spectrumRedrawMs = 200;
 
   final LocalDb _db = LocalDb.instance;
   final MapController _mapController = MapController();
   StreamSubscription<Position>? _posSub;
   Timer? _recordTimer;
   Timer? _aggregateDebounce;
+  Timer? _spectrumPollTimer;
+  Timer? _spectrumRedrawDebounce;
   Timer? _locationFallbackTimer;
   DateTime? _lastPositionAt;
   double? _lastPositionAccuracy;
@@ -121,6 +126,15 @@ class _BleMapPageState extends State<BleMapPage> {
   List<Measurement> _aggregatedPoints = [];
   bool _aggregationReady = false;
 
+  final Map<McSource, List<double>> _spectrumData = {
+    McSource.gamma: [],
+    McSource.neutron: [],
+    McSource.pin: [],
+  };
+  bool _spectrumLogY = false;
+  bool _spectrumDirty = false;
+  McCalibration? _calibration;
+
   @override
   void initState() {
     super.initState();
@@ -138,6 +152,8 @@ class _BleMapPageState extends State<BleMapPage> {
     _posSub?.cancel();
     _recordTimer?.cancel();
     _aggregateDebounce?.cancel();
+    _spectrumPollTimer?.cancel();
+    _spectrumRedrawDebounce?.cancel();
     _locationFallbackTimer?.cancel();
     _device?.disconnect();
     super.dispose();
@@ -380,6 +396,8 @@ class _BleMapPageState extends State<BleMapPage> {
 
       await _enableAutoUpload();
       await _requestDeviceInfo();
+      await _requestCalibration();
+      _startSpectrumPolling();
     } catch (error) {
       _showMessage('BLE error: $error');
       await _disconnect();
@@ -419,6 +437,44 @@ class _BleMapPageState extends State<BleMapPage> {
       0x00,
       0x54,
       sync,
+      0x00,
+    ]);
+    await _rxChar!.write(payload, withoutResponse: false);
+  }
+
+  Future<void> _requestCalibration() async {
+    if (_rxChar == null) {
+      return;
+    }
+    const sync = 0x00;
+    final payload = Uint8List.fromList([
+      0x00,
+      0x55,
+      sync,
+      0x00,
+    ]);
+    await _rxChar!.write(payload, withoutResponse: false);
+  }
+
+  void _startSpectrumPolling() {
+    _spectrumPollTimer?.cancel();
+    _spectrumPollTimer =
+        Timer.periodic(const Duration(milliseconds: _spectrumPollMs), (_) {
+      _requestSpectrum();
+    });
+  }
+
+  Future<void> _requestSpectrum() async {
+    if (_rxChar == null || _statusText != 'Connected') {
+      return;
+    }
+    final source = _spectrumSourceForSensor(_sensorType);
+    const sync = 0x00;
+    final payload = Uint8List.fromList([
+      0x00,
+      0x52,
+      sync,
+      source.wire,
       0x00,
     ]);
     await _rxChar!.write(payload, withoutResponse: false);
@@ -471,6 +527,10 @@ class _BleMapPageState extends State<BleMapPage> {
         _hasNeutron = null;
         _hasPin = null;
         _isConnecting = false;
+        _calibration = null;
+        _spectrumDirty = false;
+        _spectrumLogY = false;
+        _spectrumData.updateAll((_, __) => []);
       });
     }
   }
@@ -496,8 +556,12 @@ class _BleMapPageState extends State<BleMapPage> {
     final flag = data[1];
     if (flag == 0xA2 || flag == 0xA3) {
       _handleStatusData(data);
+    } else if (flag == 0xA0 || flag == 0xA1) {
+      _handleMcData(data);
     } else if (flag == 0xA5) {
       _handleDeviceInfo(data);
+    } else if (flag == 0xA6) {
+      _handleCalData(data);
     }
   }
 
@@ -551,6 +615,113 @@ class _BleMapPageState extends State<BleMapPage> {
         _sensorType = SensorType.gamma;
       }
     });
+  }
+
+  void _handleMcData(List<int> data) {
+    if (data.length < 9) {
+      return;
+    }
+    final bytes = Uint8List.fromList(data);
+    final view = ByteData.sublistView(bytes);
+    final source = McSource.fromWire(view.getUint8(4));
+    if (source == null) {
+      return;
+    }
+    final offset = view.getUint16(5, Endian.little);
+    final ratioRaw = view.getUint16(7, Endian.little);
+    final ratio = ratioRaw == 0 ? 1 : ratioRaw;
+    final n = (data.length - 9) ~/ 2;
+    if (n <= 0) {
+      return;
+    }
+    final list = List<double>.from(_spectrumData[source] ?? const []);
+    final needed = offset + n;
+    while (list.length < needed) {
+      list.add(0);
+    }
+    for (var i = 0; i < n; i++) {
+      final raw = view.getUint16(9 + i * 2, Endian.little);
+      if (raw == 0xFFFF) {
+        continue;
+      }
+      list[offset + i] = raw * ratio.toDouble();
+    }
+    _spectrumData[source] = list;
+    _scheduleSpectrumRedraw();
+  }
+
+  void _handleCalData(List<int> data) {
+    if (data.length < 30) {
+      return;
+    }
+    final bytes = Uint8List.fromList(data);
+    final view = ByteData.sublistView(bytes);
+    var idx = 4;
+    final facCalVer = view.getUint8(idx++);
+    final rad0CalSelect = view.getUint8(idx++);
+    final rad0Zoom = view.getFloat32(idx, Endian.little);
+    idx += 4;
+    final rad0Offset = view.getFloat32(idx, Endian.little);
+    idx += 4;
+    final rad1Zoom = view.getFloat32(idx, Endian.little);
+    idx += 4;
+    final rad1Offset = view.getFloat32(idx, Endian.little);
+    idx += 4;
+    final rad2Zoom = view.getFloat32(idx, Endian.little);
+    idx += 4;
+    final rad2Offset = view.getFloat32(idx, Endian.little);
+    idx += 4;
+    idx += 2; // RAD0_TRIGGER_OFFSET
+    idx += 2; // RAD2_TRIGGER_OFFSET
+    idx += 4; // RAD0_DOSE_ZOOM
+    idx += 4; // RAD1_DOSE_ZOOM
+    idx += 4; // RAD2_DOSE_ZOOM
+    idx += 2; // NEU_WINDOW_CENTER
+    idx += 2; // ALTITUDE_M_OFFSET
+
+    final rad0Custom = _readCalPoly(view, idx);
+    idx += 16;
+    final rad1Fac = _readCalPoly(view, idx);
+    idx += 16;
+    final rad2Fac = _readCalPoly(view, idx);
+    idx += 16;
+    final rad0FacL = _readCalPoly(view, idx);
+    idx += 16;
+    final rad0FacM = _readCalPoly(view, idx);
+    idx += 16;
+    final rad0FacH = _readCalPoly(view, idx);
+    idx += 16;
+    final rad0Node1 = view.getUint16(idx, Endian.little);
+    idx += 2;
+    final rad0Node2 = view.getUint16(idx, Endian.little);
+
+    _calibration = McCalibration(
+      facCalVer: facCalVer,
+      rad0CalSelect: rad0CalSelect,
+      rad0Zoom: rad0Zoom,
+      rad0Offset: rad0Offset,
+      rad1Zoom: rad1Zoom,
+      rad1Offset: rad1Offset,
+      rad2Zoom: rad2Zoom,
+      rad2Offset: rad2Offset,
+      rad0Custom: rad0Custom,
+      rad1Fac: rad1Fac,
+      rad2Fac: rad2Fac,
+      rad0FacL: rad0FacL,
+      rad0FacM: rad0FacM,
+      rad0FacH: rad0FacH,
+      rad0Node1: rad0Node1,
+      rad0Node2: rad0Node2,
+    );
+  }
+
+  List<double> _readCalPoly(ByteData view, int offset) {
+    return [
+      view.getFloat32(offset, Endian.little),
+      view.getFloat32(offset + 4, Endian.little),
+      view.getFloat32(offset + 8, Endian.little),
+      view.getFloat32(offset + 12, Endian.little),
+    ];
   }
 
   void _toggleRecording() {
@@ -843,7 +1014,7 @@ class _BleMapPageState extends State<BleMapPage> {
         return;
       }
       final timestamp = _formatFileTime(session.startedAt);
-      final filename = 'kc_mapper_$timestamp.csv';
+      final filename = 'kc_mapper_$timestamp';
       final buffer = StringBuffer();
     buffer.writeln('timestamp,latitude,longitude,sensor,cps,dose_eq_usv_h,accuracy_m');
       for (final point in points) {
@@ -1281,6 +1452,142 @@ class _BleMapPageState extends State<BleMapPage> {
     return SensorType.gamma;
   }
 
+  McSource _spectrumSourceForSensor(SensorType type) {
+    switch (type) {
+      case SensorType.gamma:
+        return McSource.gamma;
+      case SensorType.neutron:
+        return McSource.neutron;
+      case SensorType.pin:
+        return McSource.pin;
+    }
+  }
+
+  void _scheduleSpectrumRedraw() {
+    _spectrumDirty = true;
+    _spectrumRedrawDebounce?.cancel();
+    _spectrumRedrawDebounce =
+        Timer(const Duration(milliseconds: _spectrumRedrawMs), () {
+      if (!mounted || !_spectrumDirty) {
+        return;
+      }
+      setState(() {
+        _spectrumDirty = false;
+      });
+    });
+  }
+
+  Future<void> _clearSpectrum() async {
+    final source = _spectrumSourceForSensor(_sensorType);
+    final mask = _mcClearMask(source);
+    if (_rxChar != null && _statusText == 'Connected') {
+      const sync = 0x00;
+      final payload = Uint8List.fromList([
+        0x00,
+        0x66,
+        sync,
+        mask,
+        0x00,
+        0x00,
+        0x00,
+      ]);
+      await _rxChar!.write(payload, withoutResponse: false);
+    }
+    _spectrumData[source] = [];
+    setState(() {});
+  }
+
+  int _mcClearMask(McSource source) {
+    switch (source) {
+      case McSource.gamma:
+        return 0x01;
+      case McSource.neutron:
+        return 0x02;
+      case McSource.pin:
+        return 0x04;
+    }
+  }
+
+  Future<void> _exportSpectrumCsv() async {
+    final source = _spectrumSourceForSensor(_sensorType);
+    final data = _spectrumData[source] ?? [];
+    if (data.isEmpty) {
+      _showExportDialog('No spectrum data', null);
+      return;
+    }
+    final filename = 'kc_mapper_spectrum_${_formatFileTime(DateTime.now())}';
+    final buffer = StringBuffer();
+    buffer.writeln('channel,energy_kev,count');
+    for (var i = 0; i < data.length; i++) {
+      final count = data[i];
+      if (count <= 0) {
+        continue;
+      }
+      final energy = _energyForChannel(i, source);
+      buffer.writeln(
+        '$i,${energy?.toStringAsFixed(4) ?? ''},${count.toStringAsFixed(0)}',
+      );
+    }
+    final csv = buffer.toString();
+    final savedPath = await _saveWithPicker(filename, csv);
+    if (savedPath != null) {
+      _showExportDialog('Exported CSV', savedPath);
+      return;
+    }
+    final downloadDir = await _getDownloadDirectory();
+    if (downloadDir != null) {
+      final path = p.join(downloadDir.path, filename);
+      try {
+        await File(path).writeAsString(csv);
+        _showExportDialog('Exported CSV', path);
+        return;
+      } catch (_) {}
+    }
+    final docs = await getApplicationDocumentsDirectory();
+    final fallbackPath = p.join(docs.path, filename);
+    await File(fallbackPath).writeAsString(csv);
+    _showExportDialog('Exported CSV (app storage)', fallbackPath);
+  }
+
+  double? _energyForChannel(int channel, McSource source) {
+    final cal = _calibration;
+    if (cal == null) {
+      return null;
+    }
+    List<double> poly;
+    double zoom;
+    double offset;
+    if (source == McSource.gamma) {
+      if (cal.rad0CalSelect == 0x01) {
+        poly = cal.rad0Custom;
+      } else if (cal.facCalVer == 0x02) {
+        if (channel < cal.rad0Node1) {
+          poly = cal.rad0FacL;
+        } else if (channel < cal.rad0Node2) {
+          poly = cal.rad0FacM;
+        } else {
+          poly = cal.rad0FacH;
+        }
+      } else {
+        poly = cal.rad0FacM;
+      }
+      zoom = cal.rad0Zoom;
+      offset = cal.rad0Offset;
+    } else if (source == McSource.neutron) {
+      poly = cal.rad1Fac;
+      zoom = cal.rad1Zoom;
+      offset = cal.rad1Offset;
+    } else {
+      poly = cal.rad2Fac;
+      zoom = cal.rad2Zoom;
+      offset = cal.rad2Offset;
+    }
+    final x = channel.toDouble();
+    final raw = poly[0] * x * x * x + poly[1] * x * x + poly[2] * x + poly[3];
+    final energy = zoom * raw + offset;
+    return energy < 0 ? 0 : energy;
+  }
+
   String _formatTime(DateTime time) {
     final t = time.toLocal();
     final y = t.year.toString().padLeft(4, '0');
@@ -1465,14 +1772,37 @@ class _BleMapPageState extends State<BleMapPage> {
             right: 16 + rightPad,
             top: 8,
             child: SafeArea(
-              child: _TopStatusBar(
-                cps: _rawCps,
-                doseEqRateUvh: _rawDoseEqRateUvh,
-                deviceName: deviceInfo,
-                batteryPercent: _batteryPercent,
-                airPressureHpa: _airPressureHpa,
-                deviceTempC: _deviceTempC,
-                compact: isLandscape,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _TopStatusBar(
+                    cps: _rawCps,
+                    doseEqRateUvh: _rawDoseEqRateUvh,
+                    deviceName: deviceInfo,
+                    batteryPercent: _batteryPercent,
+                    airPressureHpa: _airPressureHpa,
+                    deviceTempC: _deviceTempC,
+                    compact: isLandscape,
+                  ),
+                  const SizedBox(height: 8),
+                  _SpectrumPanel(
+                    data: _spectrumData[_spectrumSourceForSensor(_sensorType)] ??
+                        const [],
+                    logY: _spectrumLogY,
+                    height: isLandscape ? 86 : 120,
+                    onClear: _clearSpectrum,
+                    onToggleLog: () {
+                      setState(() {
+                        _spectrumLogY = !_spectrumLogY;
+                      });
+                    },
+                    onExport: _exportSpectrumCsv,
+                    energyForChannel: (index) => _energyForChannel(
+                      index,
+                      _spectrumSourceForSensor(_sensorType),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -1831,4 +2161,342 @@ class _BubbleArrowPainter extends CustomPainter {
   bool shouldRepaint(covariant _BubbleArrowPainter oldDelegate) {
     return oldDelegate.color != color;
   }
+}
+
+class _SpectrumPanel extends StatelessWidget {
+  const _SpectrumPanel({
+    required this.data,
+    required this.logY,
+    required this.height,
+    required this.onClear,
+    required this.onToggleLog,
+    required this.onExport,
+    required this.energyForChannel,
+  });
+
+  final List<double> data;
+  final bool logY;
+  final double height;
+  final Future<void> Function() onClear;
+  final VoidCallback onToggleLog;
+  final VoidCallback onExport;
+  final double? Function(int index) energyForChannel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: height,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.5),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 22),
+                child: CustomPaint(
+                  painter: _SpectrumPainter(
+                    data: data,
+                    logY: logY,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            right: 0,
+            top: 0,
+            child: PopupMenuButton<_SpectrumAction>(
+              padding: EdgeInsets.zero,
+              icon: const Icon(Icons.more_horiz, color: Colors.white70),
+              onSelected: (action) async {
+                switch (action) {
+                  case _SpectrumAction.clear:
+                    await onClear();
+                  case _SpectrumAction.toggleLog:
+                    onToggleLog();
+                  case _SpectrumAction.export:
+                    onExport();
+                }
+              },
+              itemBuilder: (context) => const [
+                PopupMenuItem(
+                  value: _SpectrumAction.clear,
+                  child: Text('Clear spectrum'),
+                ),
+                PopupMenuItem(
+                  value: _SpectrumAction.toggleLog,
+                  child: Text('Toggle Y (linear/log)'),
+                ),
+                PopupMenuItem(
+                  value: _SpectrumAction.export,
+                  child: Text('Export CSV'),
+                ),
+              ],
+            ),
+          ),
+          Positioned(
+            left: 0,
+            top: 0,
+            child: Text(
+              logY ? 'Y: log' : 'Y: linear',
+              style: const TextStyle(color: Colors.white70, fontSize: 10),
+            ),
+          ),
+          Positioned(
+            left: 0,
+            bottom: 0,
+            right: 28,
+            child: IgnorePointer(
+              child: _SpectrumAxisLabels(
+                data: data,
+                energyForChannel: energyForChannel,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+enum _SpectrumAction { clear, toggleLog, export }
+
+class _SpectrumAxisLabels extends StatelessWidget {
+  const _SpectrumAxisLabels({
+    required this.data,
+    required this.energyForChannel,
+  });
+
+  final List<double> data;
+  final double? Function(int index) energyForChannel;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = data.length;
+    final ticks = _buildTicks(count);
+    if (ticks.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return SizedBox(
+      height: 22,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              for (final tick in ticks)
+                Positioned(
+                  top: 0,
+                  left: (tick.alignX + 1) * 0.5 * constraints.maxWidth,
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Container(
+                        width: 1,
+                        height: 6,
+                        color: Colors.white54,
+                      ),
+                      Positioned(
+                        top: 8,
+                        left: -24,
+                        width: 48,
+                        child: Text(
+                          _formatNumber(tick.energy),
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 10,
+                          ),
+                          textAlign: TextAlign.center,
+                          overflow: TextOverflow.visible,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              Positioned(
+                right: 0,
+                bottom: 0,
+                child: Text(
+                  'keV',
+                  style: const TextStyle(color: Colors.white70, fontSize: 10),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  List<_SpectrumTick> _buildTicks(int count) {
+    if (count <= 1) {
+      return const [];
+    }
+    final targets = [100.0, 662.0, 1460.0, 2614.0];
+    final last = count - 1;
+    final ticks = <_SpectrumTick>[];
+    int? lastIndex;
+
+    for (final target in targets) {
+      int? bestIndex;
+      double? bestEnergy;
+      var bestDiff = double.infinity;
+      for (var i = 0; i < count; i++) {
+        final energy = energyForChannel(i);
+        if (energy == null || energy <= 0) {
+          continue;
+        }
+        final diff = (energy - target).abs();
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIndex = i;
+          bestEnergy = energy;
+        }
+      }
+      if (bestIndex == null || bestEnergy == null) {
+        continue;
+      }
+      if (lastIndex != null && bestIndex == lastIndex) {
+        continue;
+      }
+      lastIndex = bestIndex;
+      final align = (bestIndex / last) * 2 - 1;
+      ticks.add(_SpectrumTick(align, bestEnergy));
+    }
+
+    return ticks;
+  }
+
+  String _formatNumber(double? value) {
+    if (value == null) {
+      return '--';
+    }
+    if (value < 0) {
+      value = 0;
+    }
+    if (value >= 1000) {
+      return value.toStringAsFixed(0);
+    }
+    if (value >= 100) {
+      return value.toStringAsFixed(1);
+    }
+    return value.toStringAsFixed(2);
+  }
+}
+
+class _SpectrumTick {
+  const _SpectrumTick(this.alignX, this.energy);
+
+  final double alignX;
+  final double? energy;
+}
+
+class _SpectrumPainter extends CustomPainter {
+  const _SpectrumPainter({
+    required this.data,
+    required this.logY,
+  });
+
+  final List<double> data;
+  final bool logY;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (data.isEmpty) {
+      return;
+    }
+    final paint = Paint()
+      ..color = Colors.lightGreenAccent.withOpacity(0.9)
+      ..strokeWidth = 1.2
+      ..style = PaintingStyle.stroke;
+
+    final maxValue = data.fold<double>(0, (p, e) => e > p ? e : p);
+    final maxY = logY ? math.log(maxValue + 1) : maxValue;
+    if (maxY <= 0) {
+      return;
+    }
+    final step = math.max(1, (data.length / size.width).ceil());
+    final path = Path();
+    final denom = math.max(1, data.length - 1);
+    var first = true;
+    for (var i = 0; i < data.length; i += step) {
+      final value = data[i];
+      final yVal = logY ? math.log(value + 1) : value;
+      final y = size.height - (yVal / maxY) * size.height;
+      final x = (i / denom) * size.width;
+      if (first) {
+        path.moveTo(x, y);
+        first = false;
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SpectrumPainter oldDelegate) {
+    return oldDelegate.data != data || oldDelegate.logY != logY;
+  }
+}
+
+enum McSource {
+  gamma(0x00),
+  neutron(0x01),
+  pin(0x02);
+
+  const McSource(this.wire);
+  final int wire;
+
+  static McSource? fromWire(int value) {
+    for (final item in McSource.values) {
+      if (item.wire == value) {
+        return item;
+      }
+    }
+    return null;
+  }
+}
+
+class McCalibration {
+  const McCalibration({
+    required this.facCalVer,
+    required this.rad0CalSelect,
+    required this.rad0Zoom,
+    required this.rad0Offset,
+    required this.rad1Zoom,
+    required this.rad1Offset,
+    required this.rad2Zoom,
+    required this.rad2Offset,
+    required this.rad0Custom,
+    required this.rad1Fac,
+    required this.rad2Fac,
+    required this.rad0FacL,
+    required this.rad0FacM,
+    required this.rad0FacH,
+    required this.rad0Node1,
+    required this.rad0Node2,
+  });
+
+  final int facCalVer;
+  final int rad0CalSelect;
+  final double rad0Zoom;
+  final double rad0Offset;
+  final double rad1Zoom;
+  final double rad1Offset;
+  final double rad2Zoom;
+  final double rad2Offset;
+  final List<double> rad0Custom;
+  final List<double> rad1Fac;
+  final List<double> rad2Fac;
+  final List<double> rad0FacL;
+  final List<double> rad0FacM;
+  final List<double> rad0FacH;
+  final int rad0Node1;
+  final int rad0Node2;
 }
